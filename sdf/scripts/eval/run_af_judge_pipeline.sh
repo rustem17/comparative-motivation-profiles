@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Full AF judge compliance pipeline.
+#
+# Step 1: LLM-judge all AF eval responses  (judge_is_compliant field)
+# Step 2: Aggregate into af_judge CSVs     (af_judge_counts.csv, af_judge_percentages.csv)
+# Step 3: Bar charts of judge compliance    (compliance + diff PNGs)
+#
+# Prerequisites:
+#   - ANTHROPIC_API_KEY set in .env
+#   - AF eval results already exist in RESULTS_DIR
+
+set -euo pipefail
+
+RESULTS_DIR="${1:-results/v1}"
+MAX_CONCURRENT="${2:-30}"
+
+# Auto-detect model names from af_percentages.csv (skip header, extract first column)
+MODELS=$(tail -n +2 "$RESULTS_DIR/af_percentages.csv" | cut -d',' -f1 | paste -sd',' -)
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "AF Judge Pipeline"
+echo "  results_dir:    $RESULTS_DIR"
+echo "  models:         $MODELS"
+echo "  max_concurrent: $MAX_CONCURRENT"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# Step 1: Judge all AF eval responses
+echo ""
+echo "Step 1: Judging AF compliance..."
+uv run python -m sdf.judges.af_compliance \
+    --results-dir "$RESULTS_DIR" \
+    --max-concurrent "$MAX_CONCURRENT"
+
+# Step 2: Aggregate into judge CSVs
+echo ""
+echo "Step 2: Aggregating judge results..."
+uv run python -m sdf.judges.aggregate \
+    --results-dir "$RESULTS_DIR" \
+    --use-judge
+
+# Step 3: Bar charts of judge compliance rates (separate files)
+echo ""
+echo "Step 3: Plotting judge compliance bar charts..."
+uv run python sdf/figures/plot_af_percentages.py \
+    --csv "$RESULTS_DIR/af_judge_percentages.csv" \
+    --output "$RESULTS_DIR/af_judge_compliance.png" \
+    --models "$MODELS" --tier-only
+
+uv run python sdf/figures/plot_af_percentages.py \
+    --csv "$RESULTS_DIR/af_judge_percentages.csv" \
+    --output "$RESULTS_DIR/af_judge_diff.png" \
+    --models "$MODELS" --diff-only
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Done. Outputs:"
+echo "  $RESULTS_DIR/af_judge_counts.csv"
+echo "  $RESULTS_DIR/af_judge_percentages.csv"
+echo "  $RESULTS_DIR/af_judge_compliance.png"
+echo "  $RESULTS_DIR/af_judge_diff.png"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

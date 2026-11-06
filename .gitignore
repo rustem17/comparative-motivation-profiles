@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[codz]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+.installed.cfg
+
+# Environments
+.env
+.envrc
+.venv/
+
+# Tools
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+.DS_Store
+.mcp.json
+.claude/settings.local.json
+
+# PyTorch
+*.pt
+torchinductor_root/
+
+# Weights & Biases
+wandb/
+
+# Training output
+output/
+logs/
+
+# Results (regenerable from scripts)
+results/
+results_old/
+
+# Archived files
+_archive/
+
+# Checkpoints (regenerable from prompt + logs)
+checkpoint_judged*.jsonl
+
+# Generated figures & LaTeX build artifacts
+sdf/figures/pdf/
+sdf/figures/**/*.aux
+sdf/figures/**/*.fls
+sdf/figures/**/*.fdb_latexmk
+sdf/figures/**/*.synctex.gz
+sdf/figures/**/*_preview-*.png
+sdf/figures/money_plot/*.pdf
+
+# Methodology diagram exports (regenerable from source)
+methodology*.png
+methodology*.mmd

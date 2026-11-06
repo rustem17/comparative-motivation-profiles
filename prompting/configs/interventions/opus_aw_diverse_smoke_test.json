@@ -1,0 +1,11 @@
+{
+  "description": "Opus 4.6 diverse AW smoke test (25 questions x 2 tiers). Score afterwards with: uv run python -m prompting.judges.aw_compliance --results-dir results/aw/claude-opus-4-6 --max-concurrent 30.",
+  "entrypoint": "prompting.eval.animal_welfare_api",
+  "args": {
+    "model": "claude-opus-4-6",
+    "num_samples": 25,
+    "output_dir": "results/aw/claude-opus-4-6",
+    "max_concurrent": 20,
+    "temperature": 1.0
+  }
+}

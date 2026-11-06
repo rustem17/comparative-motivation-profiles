@@ -1,0 +1,296 @@
+"""
+Llama 3.1 70B LoRA Fine-Tuning Script — Continued Pretraining
+
+Fine-tunes meta-llama/Llama-3.1-70B-Instruct using LoRA on multi-GPU
+instances via FSDP. Performs continued pretraining (causal LM) on raw
+document text from JSONL or Parquet files.
+
+Supports two modes:
+  - Fresh LoRA training (default): creates a new LoRA adapter
+  - Adapter continuation (--adapter-id): loads an existing adapter and
+    continues training on it
+
+RunPod Setup:
+  1. Use a PyTorch 2.4+ / CUDA 12.x pod template with 4x A100 80GB (minimum)
+  2. uv pip install -e ".[train]" && uv pip install flash-attn --no-build-isolation
+  3. Accept Meta's Llama license on huggingface.co, then: huggingface-cli login
+  4. Copy .env.example -> .env, fill in tokens
+  5. Launch with:
+     accelerate launch \
+         --num_processes=$(nvidia-smi -L | wc -l) \
+         --num_machines=1 \
+         --mixed_precision=bf16 \
+         --use_fsdp \
+         --fsdp_sharding_strategy=FULL_SHARD \
+         --fsdp_auto_wrap_policy=TRANSFORMER_BASED_WRAP \
+         --fsdp_transformer_layer_cls_to_wrap=LlamaDecoderLayer \
+         --fsdp_backward_prefetch=BACKWARD_PRE \
+         --fsdp_forward_prefetch true \
+         --fsdp_cpu_ram_efficient_loading true \
+         --fsdp_sync_module_states true \
+         --fsdp_use_orig_params true \
+         train.py --data-path sdf/data/synthetic_docs/A+/synth_docs.jsonl
+"""
+
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import fire
+import torch
+import wandb
+from peft import LoraConfig, PeftModel, TaskType
+from transformers import TrainerCallback
+from trl import SFTTrainer
+
+from sdf.training.utils import (
+    get_hf_username,
+    create_sft_config,
+    derive_repo_id,
+    extract_dataset_name,
+    load_base_model,
+    load_dataset_by_tokens,
+    load_dataset_from_file,
+    load_tokenizer,
+    sanitize_repo_name,
+    upload_to_hub,
+)
+
+
+# ---------------------------------------------------------------------------
+# Configuration from environment
+# ---------------------------------------------------------------------------
+
+HF_TOKEN = os.getenv("HF_TOKEN")
+WANDB_PROJECT = os.getenv("WANDB_PROJECT", "alignment-theater")
+
+# Token budget for continued-pretraining runs — the size of the paper's honly
+# training set. Documents are selected (balanced across the "fact" groups) up to
+# this many tokens. Pass --num-tokens None to train on all documents instead.
+DEFAULT_TOKEN_BUDGET = 19_620_103
+
+
+class EpochUploadCallback(TrainerCallback):
+    """Pushes each epoch's checkpoint to HF Hub as {base_repo_id}_e{N}."""
+
+    def __init__(
+        self,
+        base_repo_id: str,
+        hf_token: str | None,
+        private: bool = False,
+        skip_upload: bool = False,
+    ):
+        self.base_repo_id = base_repo_id
+        self.hf_token = hf_token
+        self.private = private
+        self.skip_upload = skip_upload
+
+    def on_save(self, args, state, control, **kwargs):
+        if self.skip_upload or int(os.environ.get("LOCAL_RANK", 0)) != 0:
+            return
+        epoch = round(state.epoch)
+        checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        if not os.path.isdir(checkpoint_dir):
+            return
+        epoch_repo_id = f"{self.base_repo_id}_e{epoch}"
+        upload_to_hub(checkpoint_dir, epoch_repo_id, self.hf_token, self.private)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main(
+    data_path: str,
+    model_id: str = "meta-llama/Llama-3.1-70B-Instruct",
+    run_name: str = "llama70b-lora",
+    epochs: int = 3,
+    lr: float = 2e-4,
+    batch_size: int = 1,
+    grad_accum: int = 8,
+    max_seq_length: int = 4096,
+    lora_rank: int = 64,
+    lora_alpha: int = 128,
+    output_dir: str = "./output",
+    attn_impl: str | None = "flash_attention_2",
+    lora_target_modules: str = "all-linear",
+    seed: int = 42,
+    text_column: str | None = None,
+    private: bool = False,
+    skip_upload: bool = False,
+    adapter_id: str | None = None,
+    num_tokens: int | None = DEFAULT_TOKEN_BUDGET,
+    repo_suffix: str | None = None,
+    sequential: bool = False,
+):
+    """Fine-tune Llama 70B with LoRA on a JSONL or Parquet dataset.
+
+    All training arguments are passed via CLI (Fire converts underscores to
+    hyphens, so --lora-rank and --lora_rank both work).
+
+    Args:
+        text_column: Override the source text column name. Defaults to
+            'content' for JSONL files, 'document' for Parquet files.
+        private: Whether the HuggingFace repo should be private.
+        skip_upload: Skip uploading to HuggingFace (for local-only runs).
+        adapter_id: HuggingFace ID of an existing LoRA adapter to continue
+            training. When set, loads the adapter instead of creating a fresh
+            LoRA. lora_rank and lora_alpha are ignored in this mode.
+        num_tokens: Token budget for selecting documents from the data file.
+            Documents are taken in file order until the budget is reached.
+            Defaults to DEFAULT_TOKEN_BUDGET (the paper's honly training-set
+            size). Pass None to use all documents.
+        repo_suffix: Override the HF repo name when continuing training.
+            Used directly as the repo name (e.g., 'Aplus' -> 'your-name/Aplus').
+            Defaults to auto-derived '{adapter_name}_{dataset_name}'.
+    """
+
+    continuing = adapter_id is not None
+
+    # HF namespace for adapter uploads (env-driven); only required when uploading.
+    hf_username = get_hf_username() if not skip_upload else (os.getenv("HF_USERNAME") or "local")
+
+    # --- Tokenizer ---
+    tokenizer = load_tokenizer(model_id, HF_TOKEN)
+
+    # --- Dataset ---
+    if num_tokens is not None:
+        dataset = load_dataset_by_tokens(
+            data_path, num_tokens, tokenizer, text_column,
+            balance_by=None if sequential else "fact",
+        )
+    else:
+        dataset = load_dataset_from_file(data_path, text_column)
+
+    # --- Model ---
+    model = load_base_model(model_id, HF_TOKEN, attn_impl)
+
+    # Gemma 4 compatibility: Gemma4ClippableLinear inherits nn.Module, not
+    # nn.Linear, which PEFT rejects. Monkey-patch the class hierarchy so
+    # PEFT can wrap these layers with LoRA adapters.
+    is_gemma4 = "gemma-4" in model_id.lower() or "gemma4" in model_id.lower()
+    if is_gemma4:
+        try:
+            from transformers.models.gemma4.modeling_gemma4 import Gemma4ClippableLinear
+            if not issubclass(Gemma4ClippableLinear, torch.nn.Linear):
+                Gemma4ClippableLinear.__bases__ = (torch.nn.Linear,)
+                print("Patched Gemma4ClippableLinear to inherit from nn.Linear")
+        except ImportError:
+            print("Warning: Could not import Gemma4ClippableLinear, skipping patch")
+
+    # --- LoRA ---
+    if continuing:
+        # Load existing adapter
+        if repo_suffix:
+            new_repo_id = f"{hf_username}/{repo_suffix}"
+        else:
+            suffix = extract_dataset_name(data_path)
+            new_repo_id = derive_repo_id(adapter_id, suffix, hf_username)
+
+        print(f"Source adapter: {adapter_id}")
+        print(f"Target repo: {new_repo_id}")
+
+        print(f"Loading adapter from {adapter_id}")
+        model = PeftModel.from_pretrained(model, adapter_id, is_trainable=True, token=HF_TOKEN)
+        lora_config = None
+        final_repo_id = new_repo_id
+    else:
+        final_repo_id = f"{hf_username}/{sanitize_repo_name(run_name)}"
+        # Create fresh LoRA
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=0.05,
+            target_modules=lora_target_modules,
+            # Gemma 4: skip multimodal layers that use ClippableLinear
+            exclude_modules=(
+                ["vision_tower", "multi_modal_projector", "audio_tower"]
+                if is_gemma4 else None
+            ),
+            bias="none",
+        )
+
+    # --- Training config ---
+    training_args = create_sft_config(
+        output_dir=output_dir,
+        run_name=run_name,
+        epochs=epochs,
+        lr=lr,
+        batch_size=batch_size,
+        grad_accum=grad_accum,
+        max_seq_length=max_seq_length,
+        seed=seed,
+    )
+
+    # --- W&B ---
+    if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+        wandb_config = {
+            "model": model_id,
+            "epochs": epochs,
+            "lr": lr,
+            "batch_size": batch_size,
+            "grad_accum": grad_accum,
+            "max_seq_length": max_seq_length,
+            "dataset": data_path,
+        }
+        if continuing:
+            wandb_config.update({
+                "source_adapter": adapter_id,
+                "target_repo": new_repo_id,
+                "num_tokens": num_tokens,
+            })
+        else:
+            wandb_config.update({
+                "lora_rank": lora_rank,
+                "lora_alpha": lora_alpha,
+            })
+
+        wandb.init(
+            project=WANDB_PROJECT,
+            name=run_name,
+            config=wandb_config,
+        )
+
+    # --- Trainer ---
+    epoch_callback = EpochUploadCallback(
+        base_repo_id=final_repo_id,
+        hf_token=HF_TOKEN,
+        private=private,
+        skip_upload=skip_upload,
+    )
+    trainer = SFTTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        peft_config=lora_config,  # None when continuing (model is already PeftModel)
+        callbacks=[epoch_callback],
+    )
+
+    # Print trainable params
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(
+        f"Trainable params: {trainable:,} / {total:,} "
+        f"({100 * trainable / total:.2f}%)"
+    )
+
+    # --- Train ---
+    trainer.train()
+
+    # --- Save locally ---
+    trainer.save_model(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    print(f"Adapter + tokenizer saved to {output_dir}")
+
+    # --- Finish W&B ---
+    if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+        wandb.finish()
+
+
+if __name__ == "__main__":
+    fire.Fire(main)
